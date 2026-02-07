@@ -64,7 +64,7 @@ fn reactive(device_name: Option<String>) -> Result<()> {
     let mic_level_for_input = mic_level.clone();
     let mic_level_for_monitor = mic_level.clone();
 
-    let key_level = keyboard_input();
+    let key_level = keyboard_input(0.2);
     let key_level_for_monitor = key_level.clone();
 
     // The synthesis graph
@@ -223,7 +223,7 @@ fn hybrid(device_name: Option<String>) -> Result<()> {
     )?;
 
     // KEYBOARD INPUT
-    let key_energy = keyboard_input();
+    let key_energy = keyboard_input(0.025);
     let key_logic = key_energy.clone();
 
     // THE COMPOSER
@@ -322,7 +322,7 @@ fn hybrid(device_name: Option<String>) -> Result<()> {
     Ok(())
 }
 
-fn keyboard_input() -> Shared {
+fn keyboard_input(sensitivity: f32) -> Shared {
     let energy = shared(0.0f32);
     let energy_out = energy.clone();
 
@@ -344,7 +344,7 @@ fn keyboard_input() -> Shared {
                     }
 
                     // Impulsively add energy
-                    current_energy += 0.20;
+                    current_energy += sensitivity;
                 }
             }
 
