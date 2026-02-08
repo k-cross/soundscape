@@ -1,7 +1,18 @@
+mod echo_canceller;
+mod effects;
+mod granular;
+
 use anyhow::Result;
 use clap::{Parser, ValueEnum};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{
+    FromSample, Host, Sample, SizedSample,
+    traits::{DeviceTrait, HostTrait, StreamTrait},
+};
+use crossbeam_channel::{Receiver, Sender, bounded};
+use echo_canceller::{EchoCanceller, VoiceActivityDetector};
+use effects::EffectsChain;
 use fundsp::prelude32::*;
+use granular::{DreamyPreset, GranularEngine};
 use log::{debug, error};
 use std::io::Write;
 
@@ -25,6 +36,7 @@ struct Args {
 enum Mode {
     Reactive,
     Hybrid,
+    Dreamy,
 }
 
 fn main() -> Result<()> {
@@ -48,6 +60,7 @@ fn main() -> Result<()> {
     match args.mode {
         Mode::Reactive => reactive(args.device),
         Mode::Hybrid => hybrid(args.device),
+        Mode::Dreamy => dreamy(args.device),
     }
 }
 
@@ -70,7 +83,6 @@ fn reactive(device_name: Option<String>) -> Result<()> {
     // The synthesis graph
     // A drone that gets "brighter" and more chaotic as the room gets louder
     let base_freq = 55.0f32; // Low A
-
     let mic = var(&mic_level);
     let key = var(&key_level);
     let control = mic + key;
@@ -102,27 +114,8 @@ fn reactive(device_name: Option<String>) -> Result<()> {
     synth.set_sample_rate(config.sample_rate() as f64);
 
     // The input stream
-    let input_device = if let Some(name) = device_name {
-        host.input_devices()?
-            .find(|d| {
-                d.description()
-                    .map(|n| n.to_string().contains(&name))
-                    .unwrap_or(false)
-            })
-            .expect("Could not find specified input device")
-    } else {
-        host.default_input_device().expect("No input device")
-    };
-
-    println!(
-        "Using Input Device: {}",
-        input_device
-            .description()
-            .map(|d| d.to_string())
-            .unwrap_or("Unknown".to_string())
-    );
+    let input_device = get_mic(device_name, host)?;
     let input_config = input_device.default_input_config()?;
-
     let input_stream = input_device.build_input_stream(
         &input_config.into(),
         move |data: &[f32], _| {
@@ -193,27 +186,9 @@ fn hybrid(device_name: Option<String>) -> Result<()> {
     synth.set_sample_rate(config.sample_rate() as f64);
 
     // MICROPHONE INPUT
-    let in_device = if let Some(name) = device_name {
-        host.input_devices()?
-            .find(|d| {
-                d.description()
-                    .map(|n| n.to_string().contains(&name))
-                    .unwrap_or(false)
-            })
-            .expect("Could not find specified input device")
-    } else {
-        host.default_input_device().expect("No input device")
-    };
-
-    println!(
-        "Using Input Device: {}",
-        in_device
-            .description()
-            .map(|d| d.to_string())
-            .unwrap_or("Unknown".to_string())
-    );
-    let in_stream = in_device.build_input_stream(
-        &in_device.default_input_config()?.into(),
+    let mic_device = get_mic(device_name, host)?;
+    let in_stream = mic_device.build_input_stream(
+        &mic_device.default_input_config()?.into(),
         move |data: &[f32], _| {
             let rms = (data.iter().map(|&x| x * x).sum::<f32>() / data.len() as f32).sqrt();
             energy_in.set_value(rms);
@@ -282,7 +257,7 @@ fn hybrid(device_name: Option<String>) -> Result<()> {
             // Log for debugging/visualization
             if step % 8 == 0 {
                 debug!(
-                    "> Loop. Mic: {:.3}, Key: {:.3} -> Chaos: {:.2}\r",
+                    "> Loop. Mic: {:.3}, Key: {:.3} -> Chaos: {:.2}",
                     mic_e, key_e, chaos
                 );
             }
@@ -355,4 +330,265 @@ fn keyboard_input(sensitivity: f32) -> Shared {
     });
 
     energy_out
+}
+
+fn dreamy(device_name: Option<String>) -> Result<()> {
+    // Setup audio host
+    let host = cpal::default_host();
+    let output_device = host
+        .default_output_device()
+        .expect("No output device available");
+
+    println!("Output device: {}", output_device.description()?);
+
+    // Get input config
+    let input_device = get_mic(device_name, host)?;
+    let input_config = input_device.default_input_config()?;
+    println!("Input config: {:?}", input_config);
+
+    // Get output config
+    let output_config = output_device.default_output_config()?;
+    println!("Output config: {:?}\n", output_config);
+
+    let sample_rate = input_config.sample_rate();
+
+    // Create channel for passing audio between input and output streams
+    let (tx, rx): (Sender<f32>, Receiver<f32>) = bounded(8192);
+
+    // Build input stream
+    let input_stream = match input_config.sample_format() {
+        cpal::SampleFormat::I8 => {
+            build_input_stream::<i8>(&input_device, &input_config.into(), tx)?
+        }
+        cpal::SampleFormat::I16 => {
+            build_input_stream::<i16>(&input_device, &input_config.into(), tx)?
+        }
+        cpal::SampleFormat::I32 => {
+            build_input_stream::<i32>(&input_device, &input_config.into(), tx)?
+        }
+        cpal::SampleFormat::I64 => {
+            build_input_stream::<i64>(&input_device, &input_config.into(), tx)?
+        }
+        cpal::SampleFormat::U8 => {
+            build_input_stream::<u8>(&input_device, &input_config.into(), tx)?
+        }
+        cpal::SampleFormat::U16 => {
+            build_input_stream::<u16>(&input_device, &input_config.into(), tx)?
+        }
+        cpal::SampleFormat::U32 => {
+            build_input_stream::<u32>(&input_device, &input_config.into(), tx)?
+        }
+        cpal::SampleFormat::U64 => {
+            build_input_stream::<u64>(&input_device, &input_config.into(), tx)?
+        }
+        cpal::SampleFormat::F32 => {
+            build_input_stream::<f32>(&input_device, &input_config.into(), tx)?
+        }
+        cpal::SampleFormat::F64 => {
+            build_input_stream::<f64>(&input_device, &input_config.into(), tx)?
+        }
+        sample_format => panic!("Unsupported sample format: {}", sample_format),
+    };
+
+    // Build output stream
+    let output_stream = match output_config.sample_format() {
+        cpal::SampleFormat::I8 => build_output_stream::<i8>(
+            &output_device,
+            &output_config.into(),
+            rx,
+            sample_rate as f32,
+        )?,
+        cpal::SampleFormat::I16 => build_output_stream::<i16>(
+            &output_device,
+            &output_config.into(),
+            rx,
+            sample_rate as f32,
+        )?,
+        cpal::SampleFormat::I32 => build_output_stream::<i32>(
+            &output_device,
+            &output_config.into(),
+            rx,
+            sample_rate as f32,
+        )?,
+        cpal::SampleFormat::I64 => build_output_stream::<i64>(
+            &output_device,
+            &output_config.into(),
+            rx,
+            sample_rate as f32,
+        )?,
+        cpal::SampleFormat::U8 => build_output_stream::<u8>(
+            &output_device,
+            &output_config.into(),
+            rx,
+            sample_rate as f32,
+        )?,
+        cpal::SampleFormat::U16 => build_output_stream::<u16>(
+            &output_device,
+            &output_config.into(),
+            rx,
+            sample_rate as f32,
+        )?,
+        cpal::SampleFormat::U32 => build_output_stream::<u32>(
+            &output_device,
+            &output_config.into(),
+            rx,
+            sample_rate as f32,
+        )?,
+        cpal::SampleFormat::U64 => build_output_stream::<u64>(
+            &output_device,
+            &output_config.into(),
+            rx,
+            sample_rate as f32,
+        )?,
+        cpal::SampleFormat::F32 => build_output_stream::<f32>(
+            &output_device,
+            &output_config.into(),
+            rx,
+            sample_rate as f32,
+        )?,
+        cpal::SampleFormat::F64 => build_output_stream::<f64>(
+            &output_device,
+            &output_config.into(),
+            rx,
+            sample_rate as f32,
+        )?,
+        sample_format => panic!("Unsupported sample format: {}", sample_format),
+    };
+
+    // Start streams
+    input_stream.play()?;
+    output_stream.play()?;
+
+    println!("   Processing started! Speak into your microphone...");
+    println!("   Press Ctrl+C to stop");
+
+    std::thread::park();
+
+    Ok(())
+}
+
+fn build_input_stream<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    tx: Sender<f32>,
+) -> Result<cpal::Stream, cpal::BuildStreamError>
+where
+    T: SizedSample,
+    f32: FromSample<T>,
+{
+    let channels = config.channels as usize;
+
+    let stream = device.build_input_stream(
+        config,
+        move |data: &[T], _: &cpal::InputCallbackInfo| {
+            for frame in data.chunks(channels) {
+                // Convert to mono by averaging channels
+                let mut sample = 0.0f32;
+                for &channel_sample in frame {
+                    sample += f32::from_sample(channel_sample);
+                }
+                sample /= channels as f32;
+
+                // Send to processing thread
+                let _ = tx.try_send(sample);
+            }
+        },
+        |err| eprintln!("Input stream error: {}", err),
+        None,
+    )?;
+
+    Ok(stream)
+}
+
+fn build_output_stream<T>(
+    device: &cpal::Device,
+    config: &cpal::StreamConfig,
+    rx: Receiver<f32>,
+    sample_rate: f32,
+) -> Result<cpal::Stream, cpal::BuildStreamError>
+where
+    T: SizedSample + FromSample<f32>,
+{
+    let channels = config.channels as usize;
+
+    // Create echo canceller (1024 taps ≈ 23ms at 44.1kHz, covers typical room acoustics)
+    let mut echo_canceller = EchoCanceller::new(1024, 0.5);
+
+    // Create voice activity detector for better echo cancellation
+    let mut vad = VoiceActivityDetector::new(sample_rate, 0.0001);
+
+    // Create granular engine and effects
+    let mut engine = GranularEngine::new(
+        sample_rate,
+        2000.0, // 2 second buffer
+        64,     // max grains
+    );
+
+    // Configure for dreamy/melancholic preset
+    DreamyPreset::configure_engine(&mut engine);
+
+    let mut effects = EffectsChain::new_dreamy(sample_rate);
+
+    // Store previous speaker output for echo reference
+    // FIXME: need to actually retrieve this from somewhere, totally useless right now
+    let mut previous_speaker_output = 0.0;
+
+    let stream = device.build_output_stream(
+        config,
+        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            for frame in data.chunks_mut(channels) {
+                // Get input sample
+                let input_sample = rx.try_recv().unwrap_or(0.0);
+
+                // Apply echo cancellation
+                // This removes the speaker output that was picked up by the microphone
+                let echo_cancelled = echo_canceller.process(input_sample, previous_speaker_output);
+
+                // Detect voice activity and enable adaptation only when speaker output is present
+                let speaker_active = vad.process(previous_speaker_output.abs());
+                echo_canceller.set_adaptation_enabled(speaker_active);
+
+                // Write to granular buffer
+                engine.write_input(echo_cancelled);
+
+                // Process granular synthesis
+                let granular_output = engine.process();
+
+                // Apply effects chain
+                let processed = effects.process(granular_output);
+
+                // Output to all channels
+                let output_sample = T::from_sample(processed);
+                for channel in frame.iter_mut() {
+                    *channel = output_sample;
+                }
+            }
+        },
+        |err| eprintln!("Output stream error: {}", err),
+        None,
+    )?;
+
+    Ok(stream)
+}
+
+fn get_mic(device_name: Option<String>, host: Host) -> Result<cpal::Device> {
+    let mic = if let Some(name) = device_name {
+        host.input_devices()?
+            .find(|d| {
+                d.description()
+                    .map(|n| n.to_string().contains(&name))
+                    .unwrap_or(false)
+            })
+            .expect("Could not find specified input device")
+    } else {
+        host.default_input_device().expect("No input device")
+    };
+
+    println!(
+        "Using Input Device: {}",
+        mic.description()
+            .map(|d| d.to_string())
+            .unwrap_or("Unknown".to_string())
+    );
+    Ok(mic)
 }

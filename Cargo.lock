@@ -2095,6 +2095,7 @@ dependencies = [
  "anyhow",
  "clap",
  "cpal 0.17.1",
+ "crossbeam-channel",
  "crossterm",
  "env_logger",
  "fundsp 0.23.0",
